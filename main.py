@@ -8,14 +8,19 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 import ogbench
 from tqdm import tqdm
+import sys
+# --- CRITICAL FIX: Clean the path ---
+# 1. Add current working directory to the top
+sys.path.insert(0, os.getcwd())
+
+# 2. Remove any path that contains 'LEGS' to prevent importing the old project
+# This handles cases where PYTHONPATH includes the other folder
+sys.path = [p for p in sys.path if "LEGS" not in p]
 
 # --- Import Models & Training Functions ---
-from src.models.small_nets import Encoder, EBTPolicy, InverseDynamicsModel, ForwardDynamicsModel
+from src.models.small_nets import Encoder, SkillPolicy
 from src.models.encoder import train_encoder
-from src.models.ebt import train_ebt
-from src.models.idm import train_idm
-from src.models.fdm import train_fdm
-from src.models.gas import GASGraph
+from src.models.actor import train_actor
 # --- Import Utils ---
 from src.utils import DynamicsDataManager
 from src.utils import rms_norm
@@ -23,6 +28,7 @@ from src.utils import rms_norm
 
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
+
 
 
 def plot_maze_background(ax, env):
@@ -92,17 +98,24 @@ def get_component(name, model_class, train_fn, config, base_config, env, train_d
     device = torch.device(base_config['device'])
     out_dir = os.path.join(base_config['root'], config['output']['dir'], name)
     final_path = os.path.join(out_dir, f"{name}_final.pth")
-    
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+
+
     # 1. Initialize Model Architecture
     if name == 'encoder':
         cfg = config['encoder']
-        state_dim = env.observation_space.shape[0]
         model = model_class(state_dim, cfg['z_dim'], cfg['hidden_dim']).to(device)
-
+    elif name == 'actor':
+        cfg = config['actor']
+        z_dim = config['encoder']['z_dim']
+        model = model_class(state_dim, action_dim, z_dim, cfg['hidden_dim']).to(device)
+    else:
+        raise ValueError(f"Unknown component name: {name}")
     # 2. Check Logic
     model_exists = os.path.exists(final_path)
     force_train = base_config.get('force_train', False)
-    
+    extra_args = extra_args or {}
     # Overrides
     if base_config.get(f'force_train_{name}', False):
         force_train = True
@@ -139,7 +152,7 @@ def get_component(name, model_class, train_fn, config, base_config, env, train_d
             print(f"{name} weights not found at {final_path}. Starting training...")
             
 
-        return train_fn(env, train_ds, val_ds, config, base_config)
+        return train_fn(env, train_ds, val_ds, config, base_config, **extra_args)
             
 
 
@@ -166,6 +179,9 @@ def main():
     
     # A. Encoder
     encoder = get_component('encoder', Encoder, train_encoder, 
+                            config, base_config, env, train_dataset, val_dataset)
+
+    actor = get_component('actor', SkillPolicy, train_actor, 
                             config, base_config, env, train_dataset, val_dataset)
 
                             

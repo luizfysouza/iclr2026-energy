@@ -35,3 +35,23 @@ encoder:
   val_every: 1000
   save_every: 500000
 
+
+
+actor:
+  # Architecture (Must match Encoder Z)
+  hidden_dim: 512
+  
+  # Training Parameters
+  steps: 1000000
+  batch_size: 1024
+  lr: 0.0003
+  
+  # HILP Specifics
+  skill_discount: 0.99
+  skill_expectile: 0.9
+  skill_temperature: 10.0
+  target_update_rate: 0.005
+  
+  # Logging
+  log_every: 1000
+  save_every: 250000

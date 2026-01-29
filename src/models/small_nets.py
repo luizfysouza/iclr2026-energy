@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.utils as utils
-
+from torch.distributions import Normal
 
 # Encoder Nets
 
@@ -43,116 +43,79 @@ class EnsembledValueFcuntion(nn.Module):
         dist2 = torch.norm(z_s2 - z_g2, p=2, dim=-1)
         return -dist1, -dist2
 
-# EBT Nets
-class SinusoidalPositionalEmbedding(nn.Module):
-    def __init__(self, dim, max_len=5000):
+
+class SkillPolicy(nn.Module):
+    def __init__(self, state_dim, action_dim, z_dim, hidden_dim=512):
         super().__init__()
-        pe = torch.zeros(max_len, dim)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        # x: (Batch, Seq_Len, Dim)
-        seq_len = x.size(1)
-        return x + self.pe[:seq_len, :].unsqueeze(0)
-
-
-class EBTPolicy(nn.Module):
-    def __init__(self, state_dim, action_dim, d_model=256, nhead=4, num_layers=4, window_size=16):
-        super().__init__()
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.window_size = window_size
+        # Input: State + Skill
+        input_dim = state_dim + z_dim
         
-        # 1. Embeddings (Spectral Norm Stabilizes inputs)
-        self.state_emb = utils.spectral_norm(nn.Linear(state_dim, d_model))
-        self.action_emb = utils.spectral_norm(nn.Linear(action_dim, d_model))
-        self.pos_encoder = SinusoidalPositionalEmbedding(d_model, max_len=window_size)
+        # Shared trunk
+        self.trunk = nn.Sequential(
+            LayerNormMLP(input_dim, hidden_dim),
+            LayerNormMLP(hidden_dim, hidden_dim),
+            LayerNormMLP(hidden_dim, hidden_dim)
+        )
         
-        # 2. Transformer Encoder
-        # Note: Standard LayerNorm inside the Transformer is usually sufficient, 
-        # but Spectral Norm on the feedforward blocks inside is also possible if desperate.
-        # For now, standard TransformerEncoder is likely fine if input/output are controlled.
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=d_model*4, batch_first=True, norm_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        # Log std as a learnable parameter, initialized to 0
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
+
+    def forward(self, s, z, temperature=1.0):
+        x = torch.cat([s, z], dim=-1)
+        x = self.trunk(x)
+        mu = self.mean(x)
         
-        # 3. Energy Head (CRITICAL for Spectral Norm)
-        # This prevents the final scalar from exploding.
-        self.energy_head = utils.spectral_norm(nn.Linear(d_model, 1))
+        # Clamp log_std for stability (as per HILP reference)
+        log_std = torch.clamp(self.log_std, -5.0, 2.0)
+        std = log_std.exp().expand_as(mu) * temperature
+        return Normal(mu, std)
 
-    def forward(self, state, action_chunk):
-        # ... (Forward logic remains exactly the same) ...
-        B, H, _ = action_chunk.shape
-        state_token = self.state_emb(state).unsqueeze(1)
-        action_tokens = self.action_emb(action_chunk)
-        action_tokens = self.pos_encoder(action_tokens)
-        seq = torch.cat([state_token, action_tokens], dim=1)
-        out = self.transformer(seq)
-        state_out = out[:, 0, :]
-        
-        # Output is (B, 1)
-        return self.energy_head(state_out)
-
-# IDM
-
-class InverseDynamicsModel(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256, num_layers=3):
+    @torch.no_grad()
+    def sample_actions(self, s, z, temperature, deterministic=False):
         """
-        Predicts action a_t given state s_t and next state s_{t+1}.
-        Input: Concatenation of (s_t, s_{t+1}) -> Dimension 2 * state_dim
-        Output: Action a_t -> Dimension action_dim
+        Use this method when interacting with the environment.
         """
-        super().__init__()
+        dist = self(s, z, temperature=temperature)
         
-        input_dim = state_dim * 2
-        
-        layers = []
-        # Input Layer
-        layers.append(LayerNormMLP(input_dim, hidden_dim))
-        
-        # Hidden Layers
-        for _ in range(num_layers - 1):
-            layers.append(LayerNormMLP(hidden_dim, hidden_dim))
-        
-        # Output Layer
-        # We use a raw Linear layer (no activation) to allow the model to 
-        # predict the exact action magnitude required.
-        layers.append(nn.Linear(hidden_dim, action_dim))
-        
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, state, next_state):
-        # Concatenate s_t and s_{t+1} along the feature dimension
-        x = torch.cat([state, next_state], dim=-1)
-        return torch.tanh(self.net(x))  # Assuming actions are bounded between -1 and 1
-
-
-# FDM
-
-class ForwardDynamicsModel(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256, num_layers=3):
-        """
-        Predicts next state s_{t+1} given state s_t and action a_t.
-        """
-        super().__init__()
-        input_dim = state_dim + action_dim
-        
-        layers = []
-        layers.append(LayerNormMLP(input_dim, hidden_dim))
-        for _ in range(num_layers - 1):
-            layers.append(LayerNormMLP(hidden_dim, hidden_dim))
+        if deterministic:
+            action = dist.mean
+        else:
+            action = dist.sample()
             
-        # Output is delta_s (change in state) or next_s directly.
-        # Predicting delta is usually easier for optimization.
-        layers.append(nn.Linear(hidden_dim, state_dim))
-        
-        self.net = nn.Sequential(*layers)
+        # CRITICAL: HILP manually clips actions to [-1, 1]
+        return torch.clamp(action, -1.0, 1.0)
 
-    def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        # Often better to predict residual: s_next = s + delta
-        delta_s = self.net(x)
-        return state + delta_s
+class SkillCritic(nn.Module):
+    def __init__(self, state_dim, action_dim, z_dim, hidden_dim=512):
+        super().__init__()
+        # Input: State + Action + Skill
+        input_dim = state_dim + action_dim + z_dim
+        
+        self.net = nn.Sequential(
+            LayerNormMLP(input_dim, hidden_dim),
+            LayerNormMLP(hidden_dim, hidden_dim),
+            LayerNormMLP(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, s, a, z):
+        x = torch.cat([s, a, z], dim=-1)
+        return self.net(x)
+
+class SkillValueFunction(nn.Module):
+    def __init__(self, state_dim, z_dim, hidden_dim=512):
+        super().__init__()
+        # Input: State + Skill
+        input_dim = state_dim + z_dim
+        
+        self.net = nn.Sequential(
+            LayerNormMLP(input_dim, hidden_dim),
+            LayerNormMLP(hidden_dim, hidden_dim),
+            LayerNormMLP(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, s, z):
+        x = torch.cat([s, z], dim=-1)
+        return self.net(x)
