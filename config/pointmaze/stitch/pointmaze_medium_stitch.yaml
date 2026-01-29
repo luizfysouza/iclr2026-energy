@@ -1,0 +1,36 @@
+env:
+  name: "pointmaze-medium-stitch-v0"
+  device: "cuda"
+
+hyperparameters:
+  seed: 42
+  num_workers: 8
+  max_lambda_c: 50000.0
+  max_lambda_g: 1500.0
+  min_lambda_g: 500.0
+  max_lambda_e: 100.0
+  lambda_action: 1000.0
+  opt_steps: 7500
+  lr: 1e-2
+
+output:
+  dir: "pointmaze_stitch/medium"
+
+encoder:
+  # Model Architecture
+  z_dim: 32
+  hidden_dim: 512
+  
+  # Training / Optimizer Parameters
+  batch_size: 1024
+  steps: 1000000
+  lr: 0.0003
+  weight_decay: 1e-4
+  discount_factor: 0.99
+  expectile: 0.95
+  target_update_rate: 0.005
+  
+  # Logging & Saving
+  log_every: 1000
+  val_every: 1000
+  save_every: 500000

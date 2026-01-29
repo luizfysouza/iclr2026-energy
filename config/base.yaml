@@ -1,0 +1,5 @@
+root: "/sonic_home/luizfacury/iclr2026-energy/outputs"
+device: "cuda"
+force_train: false  # Set to true to overwrite existing models
+download_ogbench_dir: "/sonic_home/luizfacury/ogbench"
+seed: 42
